@@ -45,6 +45,11 @@ public class ShelfMirror.Indicator : Wingpanel.Indicator {
     private const uint WATCHDOG_MS = 2500;
     private const int MAX_START_ATTEMPTS = 4;
 
+    // Grace period after the popover opens before the camera is actually
+    // started. The spinner shows immediately, but a quick open/close (e.g. a
+    // stray click) never spins the camera up.
+    private const uint ACTIVATION_DEBOUNCE_MS = 500;
+
     private Gtk.Image? icon = null;
     private Gtk.Stack? stack = null;
     private Gtk.Overlay? camera_overlay = null;
@@ -69,6 +74,7 @@ public class ShelfMirror.Indicator : Wingpanel.Indicator {
 
     // Stream supervision.
     private bool is_open = false;
+    private uint activation_id = 0;
     private uint watchdog_id = 0;
     private uint bus_watch_id = 0;
     private int start_attempts = 0;
@@ -787,20 +793,32 @@ public class ShelfMirror.Indicator : Wingpanel.Indicator {
 
     /* ---- Wingpanel lifecycle ------------------------------------------ */
 
-    /* Called by Wingpanel when the popover opens — start streaming fresh. */
+    /* Called by Wingpanel when the popover opens — start streaming fresh.
+     * The spinner shows at once, but the camera only spins up once the
+     * popover has stayed open past the debounce window. */
     public override void opened () {
         if (stack != null) {
             stack.visible_child_name = "camera";
         }
 
         is_open = true;
-        start_stream (true);
+        show_loading ();
+
+        clear_source (ref activation_id);
+        activation_id = Timeout.add (ACTIVATION_DEBOUNCE_MS, () => {
+            activation_id = 0;
+            if (is_open) {
+                start_stream (true);
+            }
+            return Source.REMOVE;
+        });
     }
 
     /* Called by Wingpanel when the popover closes — release the camera. */
     public override void closed () {
         is_open = false;
 
+        clear_source (ref activation_id);
         clear_source (ref settle_id);
         teardown_pipeline ();
         if (spinner != null) {
