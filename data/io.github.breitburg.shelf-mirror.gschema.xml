@@ -6,5 +6,10 @@
       <summary>Camera device</summary>
       <description>The /dev/video path of the webcam to display. An empty value uses the system default camera.</description>
     </key>
+    <key name="resolution" type="s">
+      <default>"360x250"</default>
+      <summary>Preview resolution</summary>
+      <description>The "WIDTHxHEIGHT" size of the preview, which also sets the popover size.</description>
+    </key>
   </schema>
 </schemalist>

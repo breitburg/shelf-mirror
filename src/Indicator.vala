@@ -19,10 +19,16 @@
 public class ShelfMirror.Indicator : Wingpanel.Indicator {
     private const string SCHEMA_ID = "io.github.breitburg.shelf-mirror";
 
-    // Sized to the camera's native aspect ratio (848:588 ≈ 1.44:1) so the
-    // feed fills the popover edge to edge with no letterbox bars.
-    private const int VIEW_WIDTH = 360;
-    private const int VIEW_HEIGHT = 250;
+    // Current preview size (the popover sizes to this). Chosen in Settings;
+    // kept at ~1.44:1 to match the camera and avoid letterboxing.
+    private int view_width = 360;
+    private int view_height = 250;
+
+    // Selectable preview resolutions, all ~1.44:1. videoscale renders the
+    // camera to whichever is picked, so any size works regardless of the camera.
+    private const string[] RESOLUTIONS = {
+        "288x200", "360x250", "432x300", "576x400", "720x500"
+    };
 
     // Corner radius matching the elementary popover's content area.
     private const double CORNER_RADIUS = 5.0;
@@ -46,6 +52,7 @@ public class ShelfMirror.Indicator : Wingpanel.Indicator {
     private Gtk.Spinner? spinner = null;
     private Gtk.Label? error_label = null;
     private Gtk.ComboBoxText? camera_combo = null;
+    private Gtk.ComboBoxText? resolution_combo = null;
 
     private Gst.Element? pipeline = null;
 
@@ -106,7 +113,7 @@ public class ShelfMirror.Indicator : Wingpanel.Indicator {
                 transition_duration = 200,
                 hhomogeneous = true,
                 vhomogeneous = false,
-                width_request = VIEW_WIDTH,
+                width_request = view_width,
                 hexpand = true,
                 vexpand = true,
                 halign = Gtk.Align.FILL,
@@ -177,8 +184,8 @@ public class ShelfMirror.Indicator : Wingpanel.Indicator {
         // paints straight onto the popover and keeps its rounded transparent
         // corners; the spinner, message and menu button float on top.
         camera_overlay = new Gtk.Overlay () {
-            width_request = VIEW_WIDTH,
-            height_request = VIEW_HEIGHT
+            width_request = view_width,
+            height_request = view_height
         };
         camera_overlay.add (drawing_area);
         camera_overlay.add_overlay (spinner);
@@ -219,6 +226,7 @@ public class ShelfMirror.Indicator : Wingpanel.Indicator {
         settings_item.clicked.connect (() => {
             menu_popover.popdown ();
             populate_cameras ();
+            populate_resolutions ();
             stack.visible_child_name = "settings";
         });
         about_item.clicked.connect (() => {
@@ -245,6 +253,16 @@ public class ShelfMirror.Indicator : Wingpanel.Indicator {
         };
         camera_combo.changed.connect (on_camera_selected);
 
+        var resolution_label = new Gtk.Label ("Resolution") {
+            halign = Gtk.Align.END
+        };
+
+        resolution_combo = new Gtk.ComboBoxText () {
+            hexpand = true,
+            valign = Gtk.Align.CENTER
+        };
+        resolution_combo.changed.connect (on_resolution_selected);
+
         var grid = new Gtk.Grid () {
             row_spacing = 12,
             column_spacing = 12,
@@ -252,9 +270,84 @@ public class ShelfMirror.Indicator : Wingpanel.Indicator {
         };
         grid.attach (camera_label, 0, 0);
         grid.attach (camera_combo, 1, 0);
+        grid.attach (resolution_label, 0, 1);
+        grid.attach (resolution_combo, 1, 1);
 
         page.add (grid);
         return page;
+    }
+
+    private void populate_resolutions () {
+        if (resolution_combo == null) {
+            return;
+        }
+
+        populating = true;
+        resolution_combo.remove_all ();
+        foreach (var spec in RESOLUTIONS) {
+            resolution_combo.append (spec, label_for_resolution (spec));
+        }
+
+        var current = "%dx%d".printf (view_width, view_height);
+        if (!resolution_combo.set_active_id (current)) {
+            // A saved size that isn't a preset — list it so it shows as selected.
+            resolution_combo.append (current, label_for_resolution (current));
+            resolution_combo.set_active_id (current);
+        }
+        populating = false;
+    }
+
+    private string label_for_resolution (string spec) {
+        var parts = spec.split ("x");
+        return parts.length == 2 ? "%s × %s".printf (parts[0], parts[1]) : spec;
+    }
+
+    private void on_resolution_selected () {
+        if (populating) {
+            return;
+        }
+
+        var id = resolution_combo.active_id;
+        if (id == null || id == "%dx%d".printf (view_width, view_height)) {
+            return;
+        }
+
+        set_view_size_from (id);
+        if (settings != null) {
+            settings.set_string ("resolution", id);
+        }
+        apply_resolution_change ();
+    }
+
+    // Parse a "WIDTHxHEIGHT" spec into the current view size (ignored if invalid).
+    private void set_view_size_from (string spec) {
+        var parts = spec.split ("x");
+        if (parts.length == 2) {
+            int w = int.parse (parts[0]);
+            int h = int.parse (parts[1]);
+            if (w > 0 && h > 0) {
+                view_width = w;
+                view_height = h;
+            }
+        }
+    }
+
+    // Resize the preview to the new view size and restart the stream at it.
+    private void apply_resolution_change () {
+        blur_surface = null;  // dimensions changed; rebuilt lazily on next blur
+
+        if (camera_overlay != null) {
+            camera_overlay.set_size_request (view_width, view_height);
+        }
+        if (stack != null) {
+            stack.width_request = view_width;
+        }
+
+        if (is_open) {
+            start_stream (true);  // renegotiate the pipeline at the new caps
+        } else {
+            teardown_pipeline ();
+        }
     }
 
     private void populate_cameras () {
@@ -386,27 +479,34 @@ public class ShelfMirror.Indicator : Wingpanel.Indicator {
         sample = current_sample;
         sample_mutex.unlock ();
 
+        bool painted = false;
         if (sample != null) {
             var buffer = sample.get_buffer ();
             if (buffer != null) {
                 Gst.MapInfo map;
                 if (buffer.map (out map, Gst.MapFlags.READ)) {
-                    var frame = new Cairo.ImageSurface.for_data (
-                        map.data, Cairo.Format.ARGB32, VIEW_WIDTH, VIEW_HEIGHT, VIEW_WIDTH * 4
-                    );
+                    // Ignore a stale frame whose size predates a resolution change.
+                    if (map.data.length >= view_width * view_height * 4) {
+                        var frame = new Cairo.ImageSurface.for_data (
+                            map.data, Cairo.Format.ARGB32, view_width, view_height, view_width * 4
+                        );
 
-                    if (loading) {
-                        paint_blurred (cr, frame, w, h);
-                    } else {
-                        paint_frame (cr, frame, w, h);
+                        if (loading) {
+                            paint_blurred (cr, frame, w, h);
+                        } else {
+                            paint_frame (cr, frame, w, h);
+                        }
+                        painted = true;
                     }
 
                     buffer.unmap (map);
                 }
             }
-        } else {
-            // No frame: a frosted translucent panel for the spinner or the
-            // "Camera unavailable" message to sit on.
+        }
+
+        if (!painted) {
+            // No (usable) frame: a frosted translucent panel for the spinner or
+            // the "Camera unavailable" message to sit on.
             cr.set_source_rgba (0, 0, 0, SCRIM_ALPHA);
             cr.paint ();
         }
@@ -430,14 +530,14 @@ public class ShelfMirror.Indicator : Wingpanel.Indicator {
     }
 
     private void paint_frame (Cairo.Context cr, Cairo.Surface frame, int w, int h) {
-        paint_surface_scaled (cr, frame, VIEW_WIDTH, VIEW_HEIGHT, w, h, 1.0);
+        paint_surface_scaled (cr, frame, view_width, view_height, w, h, 1.0);
     }
 
     // Cheap blur: shrink the frame to a fraction of its size, then let Cairo's
     // bilinear filter smear it back up to the full view, at reduced opacity.
     private void paint_blurred (Cairo.Context cr, Cairo.Surface frame, int w, int h) {
-        int sw = int.max (1, VIEW_WIDTH / BLUR_DOWNSCALE);
-        int sh = int.max (1, VIEW_HEIGHT / BLUR_DOWNSCALE);
+        int sw = int.max (1, view_width / BLUR_DOWNSCALE);
+        int sh = int.max (1, view_height / BLUR_DOWNSCALE);
 
         if (blur_surface == null) {
             blur_surface = new Cairo.ImageSurface (Cairo.Format.ARGB32, sw, sh);
@@ -445,7 +545,7 @@ public class ShelfMirror.Indicator : Wingpanel.Indicator {
 
         // The opaque frame fully overwrites the reused buffer, so no clear needed.
         var sc = new Cairo.Context (blur_surface);
-        paint_surface_scaled (sc, frame, VIEW_WIDTH, VIEW_HEIGHT, sw, sh, 1.0);
+        paint_surface_scaled (sc, frame, view_width, view_height, sw, sh, 1.0);
         blur_surface.flush ();
 
         paint_surface_scaled (cr, blur_surface, sw, sh, w, h, LOADING_OPACITY);
@@ -478,7 +578,7 @@ public class ShelfMirror.Indicator : Wingpanel.Indicator {
                 "%s ! videoflip method=horizontal-flip ! videoconvert ! " +
                 "videoscale ! video/x-raw,format=BGRA,width=%d,height=%d ! " +
                 "appsink name=videosink emit-signals=true max-buffers=1 drop=true sync=false"
-            ).printf (src, VIEW_WIDTH, VIEW_HEIGHT);
+            ).printf (src, view_width, view_height);
             pipeline = Gst.parse_launch (description);
         } catch (Error e) {
             warning ("Could not create camera pipeline: %s", e.message);
@@ -715,6 +815,7 @@ public class ShelfMirror.Indicator : Wingpanel.Indicator {
         if (source != null && source.lookup (SCHEMA_ID, true) != null) {
             settings = new GLib.Settings (SCHEMA_ID);
             current_device = settings.get_string ("device");
+            set_view_size_from (settings.get_string ("resolution"));
             settings.changed["device"].connect (() => {
                 var device = settings.get_string ("device");
                 if (device != current_device) {
@@ -727,6 +828,18 @@ public class ShelfMirror.Indicator : Wingpanel.Indicator {
                         populating = false;
                     }
                     apply_device_change ();
+                }
+            });
+            settings.changed["resolution"].connect (() => {
+                var spec = settings.get_string ("resolution");
+                if (spec != "%dx%d".printf (view_width, view_height)) {
+                    set_view_size_from (spec);
+                    if (resolution_combo != null && !populating) {
+                        populating = true;
+                        resolution_combo.set_active_id (spec);
+                        populating = false;
+                    }
+                    apply_resolution_change ();
                 }
             });
         } else {
