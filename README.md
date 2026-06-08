@@ -7,9 +7,7 @@ else to close it (the panel dismisses the popover and the camera is released).
 
 Written in Vala, GTK 3, GStreamer, and Cairo.
 
-<p align="center">
-  <img src="screenshot.png" width="428" alt="Shelf Mirror showing a live mirrored camera view in the Wingpanel popover" />
-</p>
+![Shelf Mirror showing a live mirrored camera view in the Wingpanel popover](screenshot.png)
 
 ## Features
 
